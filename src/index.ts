@@ -9,15 +9,21 @@ import type {
 import { RPCError, createHandler } from "rpc-utils";
 import * as u8a from "uint8arrays";
 import elliptic from "elliptic";
-import LitJsSdk from "lit-js-sdk";
+import * as LitJsSdkNodeJs from "@lit-protocol/lit-node-client-nodejs";
 import { toGeneralJWS, toJose, toStableObject, sha256, log } from "./util.js";
 import {
   ContextWithLit,
   DIDMethodNameWithLit,
   DIDProviderMethodsWithLit,
   DIDProviderWithLit,
-  EcdsaSignature
+  EcdsaSignature,
 } from "./interfaces.js";
+import { getAuthSig } from "./sign.js";
+
+import { CeramicClient } from "@ceramicnetwork/http-client";
+import { TileDocument } from "@ceramicnetwork/stream-tile";
+import { getResolver } from "key-did-resolver";
+import { DID } from "dids";
 
 const ec = new elliptic.ec("secp256k1");
 
@@ -44,14 +50,14 @@ export const litActionSignAndGetSignature = async (
   sha256Payload: Uint8Array,
   context: ContextWithLit
 ): Promise<EcdsaSignature> => {
-
   log("[litActionSignAndGetSignature] sha256Payload: ", sha256Payload);
 
-  const authSig = await LitJsSdk.checkAndSignAuthMessage({ chain: "ethereum" });
-
+  const authSig = await getAuthSig();
   log("[litActionSignAndGetSignature] authSig:", authSig);
 
-  const litNodeClient = new LitJsSdk.LitNodeClient({ litNetwork: "serrano" });
+  const litNodeClient = new LitJsSdkNodeJs.LitNodeClientNodeJs({
+    litNetwork: "serrano",
+  });
 
   await litNodeClient.connect();
 
@@ -59,18 +65,22 @@ export const litActionSignAndGetSignature = async (
 
   const jsParams = {
     toSign: Array.from(sha256Payload),
-    keyId: decodeDIDWithLit(context.did),
+    publicKey: decodeDIDWithLit(context.did),
     sigName: "sig1",
   };
 
   log("[litActionSignAndGetSignature] jsParams:", jsParams);
 
   const executeOptions = {
-    ...(context.ipfsId === undefined || ! context.ipfsId) && {code: context.litCode},
-    ...(context.litCode === undefined || ! context.litCode) && {ipfsId: context.ipfsId},
+    ...((context.ipfsId === undefined || !context.ipfsId) && {
+      code: context.litCode,
+    }),
+    ...((context.litCode === undefined || !context.litCode) && {
+      ipfsId: context.ipfsId,
+    }),
     authSig,
     jsParams,
-  }
+  };
 
   const res = await litNodeClient.executeJs(executeOptions);
 
@@ -101,13 +111,11 @@ export async function encodeDIDWithLit(
 ): Promise<string> {
   // -- prepare
 
-  const pkpPubKey = PKP_PUBLIC_KEY.replace('0x', '')
+  const pkpPubKey = PKP_PUBLIC_KEY.replace("0x", "");
 
   log("[encodeDIDWithLit] pkpPubKey:", pkpPubKey);
 
-  const pubBytes = ec
-    .keyFromPublic(pkpPubKey, "hex")
-    .getPublic(true, "array");
+  const pubBytes = ec.keyFromPublic(pkpPubKey, "hex").getPublic(true, "array");
 
   log("[encodeDIDWithLit] pubBytes:", pubBytes);
 
@@ -125,48 +133,46 @@ export async function encodeDIDWithLit(
 }
 
 /**
- * 
+ *
  * Decode encodedDID and return the PKP public key in a uncompressed form
- * 
- * @param encodedDID 
+ *
+ * @param encodedDID
  * @returns { string } PKP Public Key in uncompressed form
  */
-export function decodeDIDWithLit(
-  encodedDID: string
-): string {
+export function decodeDIDWithLit(encodedDID: string): string {
+  log("[decodeDIDWithLit] encodedDID:", encodedDID);
 
-    log("[decodeDIDWithLit] encodedDID:", encodedDID);
+  // -- validate
+  const arr = encodedDID?.split(":");
 
-    // -- validate
-    const arr = encodedDID?.split(':');
+  if (arr[0] != "did") throw Error("string should start with did:");
+  if (arr[1] != "key") throw Error("string should start with did:key");
+  if (arr[2].charAt(0) !== "z")
+    throw Error("string should start with did:key:z");
 
-    if(arr[0] != 'did') throw Error('string should start with did:');
-    if(arr[1] != 'key') throw Error('string should start with did:key');
-    if(arr[2].charAt(0) !== 'z') throw Error('string should start with did:key:z');
+  const str = arr[2].substring(1);
 
-    const str = arr[2].substring(1);;
+  log("[decodeDIDWithLit] str:", str);
 
-    log("[decodeDIDWithLit] str:", str);
+  const bytes = u8a.fromString(str, "base58btc");
 
-    const bytes = u8a.fromString(str, "base58btc");
+  const originalBytes = new Uint8Array(bytes.length - 2);
 
-    const originalBytes = new Uint8Array(bytes.length - 2);
+  bytes.forEach((_, i) => {
+    originalBytes[i] = bytes[i + 2];
+  });
 
-    bytes.forEach((_, i) => {
-        originalBytes[i] = bytes[i + 2];
-    });
-    
-    log("[decodeDIDWithLit] originalBytes:", originalBytes);
+  log("[decodeDIDWithLit] originalBytes:", originalBytes);
 
-    const pubPoint = ec.keyFromPublic(originalBytes).getPublic();
-    
-    let pubKey = pubPoint.encode('hex', false);
+  const pubPoint = ec.keyFromPublic(originalBytes).getPublic();
 
-    pubKey = pubKey.charAt(0) == '0' ? pubKey.substring(1) : pubKey;
+  let pubKey = pubPoint.encode("hex", false);
 
-    log("[decodeDIDWithLit] pubKey:", pubKey);
-    
-    return '0x0' + pubKey;
+  pubKey = pubKey.charAt(0) == "0" ? pubKey.substring(1) : pubKey;
+
+  log("[decodeDIDWithLit] pubKey:", pubKey);
+
+  return "0x0" + pubKey;
 }
 
 /**
@@ -319,3 +325,37 @@ export class Secp256k1ProviderWithLit implements DIDProviderWithLit {
     return await this._handle(msg);
   }
 }
+
+const PKP_PUBLIC_KEY =
+  "0x04e9cf329c3a902299e0636e963f8d4ac7d681dfc7324be8cffe067cd7d0b7bdcf001ff2dda1e7a35c6bc7c28da389c636a0fe3aba179c79493732e987824e9222";
+
+const run = async () => {
+  const litNodeClient = new LitJsSdkNodeJs.LitNodeClientNodeJs({
+    litNetwork: "serrano",
+  });
+  await litNodeClient.connect();
+  litNodeClient.saveSigningCondition;
+
+  const ceramic = new CeramicClient("https://ceramic-clay.3boxlabs.com");
+  // -- get your encode did with your PKP public key
+  const encodedDID = await encodeDIDWithLit(PKP_PUBLIC_KEY);
+  // -- static lit action code hosted on https://ipfs.io/ipfs/QmYrfiMf6TDuU3NiTbZANiELNBCyn2f66Zok3gEuzRTYmL
+  const provider = new Secp256k1ProviderWithLit({
+    did: encodedDID,
+    ipfsId: "QmNjkECL37oveLZuFuNHNWfpYSaWeBUYFkrDPeoqQWoTLQ",
+  });
+  const did = new DID({ provider, resolver: getResolver() as any });
+  // -- authenticate
+  await did.authenticate();
+  ceramic.did = did;
+  console.log("DID:", did);
+  // -- write to ceramic stream
+  const doc = await TileDocument.create(ceramic, "Hola hola ¿Cómo estás?");
+  console.log("Doc/StreamID:", doc.id.toString());
+  // -- read a ceramic stream
+  var loadDoc = await TileDocument.load(ceramic, doc.id.toString());
+  console.log("Specific doc:", loadDoc.content);
+};
+
+run().catch(console.error);
+console.log("test");
